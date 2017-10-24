@@ -38,7 +38,6 @@ def decrypt_message(encrypted, privkey):
         raise Exception('invalid ciphertext: length')
     magic = encrypted[:4]
     ephemeral_pubkey = binascii.hexlify(encrypted[4:37])
-    print("Using ephemeral pubkey from ctrprty: ", ephemeral_pubkey)
     ciphertext = encrypted[37:-32]
     mac = encrypted[-32:]
     if magic != b'BIE1':

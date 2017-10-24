@@ -44,8 +44,13 @@ in the above step. (VERY SIMPLE for now! Only one utxo from each party). Note th
 * Run in this repo `python snicker-tool.py -m mixdepth wallet-name utxo pubkey amount` where `amount` is the amount
 you recorded from the blockchain before, and is an integer in satoshis.
 * It should output a base64 encoded message which contains the transaction, partially signed with your utxo.
-* Assuming you know the other party that owns the utxo you found you can send them this partially signed
-transaction and they can complete the signing and broadcast.
+* For testing, pass this to the other party (in real use you will broadcast this encrypted message instead).
+Now they (or you in testing) can run `python snicker-tool.py -r privkey amount filename` (privkeys
+aren't to be passed on command line, this will be changed shortly) where `filename` is a file
+containing the encrypted message (or more than one, line separated) and the amount is the amount
+in satoshis of that party's input, as before. If it works it will output a partially signed transaction.
+* That partially signed transaction can be passed to Core and signed and broadcast using `signrawtransaction`
+and then `sendrawtransaction`.
 
 
 
