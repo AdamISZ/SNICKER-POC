@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python2
 from __future__ import print_function
 import binascii
 import os
@@ -17,7 +17,10 @@ version_bytes = "\x00\x01"
 def get_parser():
     parser = OptionParser(
         usage=
-        'usage: %prog [options] walletfile utxo pubkey amount',
+        'usage: %prog [options] walletfile utxo pubkey amount\n' + \
+        'or: %prog -r file\n' + \
+        'or: %prog -b walletfile txhex\n' + \
+        'or (testing only): %prog -p walletfile address',
         description='Creates an encrypted proposed coinjoin, or completes '
         +
         'signing of a proposed transaction.')
@@ -29,11 +32,34 @@ def get_parser():
         default=False,
         help=
         'Parse a list of encrypted messages in the file specified in the '
-        'second argument, checking them against the privkey given as first '
-        'argument (TODO replace this unsafe thing, its just for testing) '
-        ', for any match the decrypted, partially signed transaction '
-        'is output, which you can pass to signrawtransaction in bitcoind in '
-        'order to broadcast.')
+        'first argument, checking them against the privkey given by the user '
+        'on the command line, in WIF compressed format, and the input amount in '
+        'satoshis, for any match. The decrypted, partially signed transaction is '
+        'output, assuming the transaction does not lose the user more than a small '
+        'fee, and is otherwise valid, which you can pass to signrawtransaction in '
+        'Bitcoin Core or similar in order to broadcast.')
+    parser.add_option(
+        '-b',
+        '--broadcast',
+        action='store_true',
+        dest='broadcast',
+        default=False,
+        help=
+        'Takes a partially signed transaction and completes the signing, only '
+        'to be used for a receiver with a Joinmarket wallet. Pass walletfilename '
+        'as first argument and partially signed transaction hex (from -r run) '
+        'as second argument; you will be prompted whether to broadcast.')
+    parser.add_option(
+        '-p',
+        '--pubkey-only',
+        action='store_true',
+        dest='pubkey',
+        default=False,
+        help=
+        'Utility for testing only: to pass a pubkey, in a Joinmarket wallet, '
+        'across to a counterparty, instead of them having to find it on the '
+        'blockchain, use this flag and set the arguments to: walletfile address; '
+        'the pubkey for that address will be returned in hex.')
     parser.add_option('-m',
                       '--mixdepth',
                       action='store',
@@ -145,6 +171,19 @@ def deserialize_coinjoin_proposal(msg):
     return (tweak, tx)
 
 def scan_for_coinjoins(privkey, amount, filename):
+    """Given a file which contains encrypted coinjoin proposals,
+    and a private key for a pubkey with a known utxo existing
+    which we can spend, scan the entries in the file, all assumed
+    to be ECIES encrypted to a pubkey, for one which is encrypted
+    to *this* pubkey, if found, output the retrieved partially signed
+    transaction, and destination key, address to a list which is
+    returned to the caller.
+    Only if the retrieved coinjoin transaction passes basic checks
+    on validity in terms of amount paid, is it returned.
+    This is an elementary implementation that will obviously fail
+    any performance test (i.e. moderately large lists).
+    Note that the tweaked output address must be of type p2sh/p2wpkh.
+    """
     try:
         with open(filename, "rb") as f:
             msgs = f.readlines()
@@ -177,9 +216,6 @@ def scan_for_coinjoins(privkey, amount, filename):
         #add_privkeys requires both inputs to be compressed (or un-) consistently.
         tweak_priv = tweak + "01"
         my_destn_privkey = btc.add_privkeys(tweak_priv, privkey, True)
-        print('my destn addr is: ', my_destn_addr)
-        #Insecure output of privkey here, for testing only (TODO)
-        print('my destn privkey is: ', my_destn_privkey)
         my_output_index = -1
         for i, o in enumerate(deserialized_tx['outs']):
             addr = btc.script_to_address(o['script'], get_p2sh_vbyte())
@@ -187,9 +223,6 @@ def scan_for_coinjoins(privkey, amount, filename):
                 print('found our output address: ', my_destn_addr)
                 my_output_index = i
                 break
-            else:
-                print('output address was: ', addr)
-                print('not ours')
         if my_output_index == -1:
             print("Proposal doesn't contain our output address, rejecting")
             continue
@@ -205,7 +238,14 @@ def scan_for_coinjoins(privkey, amount, filename):
         valid_coinjoins.append((my_destn_addr, my_destn_privkey, tx))
     return valid_coinjoins
 
-def cli_receive(privkey, amount, filename):
+def cli_receive(filename):
+    wif_privkey = raw_input("Enter private key in WIF compressed format: ")
+    try:
+        privkey = btc.from_wif_privkey(wif_privkey, vbyte=get_p2pk_vbyte())
+    except:
+        print("Could not parse WIF privkey, quitting.")
+        return
+    amount = raw_input("Enter amount of utxo being spent, in satoshis: ")
     valid_coinjoins = scan_for_coinjoins(privkey, int(amount), filename)
     if not valid_coinjoins:
         print("Found no valid coinjoins")
@@ -213,20 +253,33 @@ def cli_receive(privkey, amount, filename):
     for vc in valid_coinjoins:
         addr, priv, tx = vc
         print("Found signable coinjoin with destination address: ", addr)
-        print("And this private key (p2sh-p2wpkh output): ", priv)
-        print("Pass this to signrawtransaction:")
-        print(tx)
+        #TODO find a more sensible file naming
+        fn = btc.txhash(tx)+".txt"
+        with open(fn, "wb") as f:
+            f.write("SNICKER output file for receiver\n"
+                    "================================\n")
+            f.write("The serialized transaction in hex:\n")
+            f.write(tx + "\n")
+            f.write("YOUR DESTINATION: " + addr + "\n")
+            f.write("PRIVATE KEY FOR THIS DESTINATION ADDRESS:\n")
+            f.write(btc.wif_compressed_privkey(priv, vbyte=get_p2pk_vbyte())+"\n")
+            f.write("The decoded transaction:\n")
+            f.write(pformat(btc.deserialize(tx))+"\n")
+        print("The partially signed transaction and the private key for your "
+              "output are stored in the file: " + fn)
+        print("Pass the transaction hex to `signrawtransaction` in Bitcoin Core "
+              "or similar if you wish to broadcast the transaction.")
 
-def cli_get_wallet(wallet_name):
+def cli_get_wallet(wallet_name, sync=True):
     walletclass = SegwitWallet if jm_single().config.get(
             "POLICY", "segwit") == "true" else Wallet    
     if not os.path.exists(os.path.join('wallets', wallet_name)):
-        wallet = walletclass(wallet_name, None)
+        wallet = walletclass(wallet_name, None, max_mix_depth=options.amtmixdepths)
     else:
         while True:
             try:
                 pwd = get_password("Enter wallet decryption passphrase: ")
-                wallet = walletclass(wallet_name, pwd)
+                wallet = walletclass(wallet_name, pwd, max_mix_depth=options.amtmixdepths)
             except WalletError:
                 print("Wrong password, try again.")
                 continue
@@ -237,13 +290,19 @@ def cli_get_wallet(wallet_name):
     if jm_single().config.get("BLOCKCHAIN",
             "blockchain_source") == "electrum-server":
         jm_single().bc_interface.synctype = "with-script"
-    sync_wallet(wallet, fast=options.fastsync)
+    if sync:
+        sync_wallet(wallet, fast=options.fastsync)
     return wallet
 
 def cli_creator(wallet_name, bob_utxo, bob_pubkey, bob_amount):
-    #Setup uses joinmarket wallet; this choice is just because it's easier for me.
+    """This setup currently uses a joinmarket wallet;
+    this choice is just because it's easier for me. Given a
+    previously identified (utxo, pubkey, amount) found on the blockchain,
+    creates a partially signed coinjoin transaction using a utxo input
+    from our own wallet.
+    """
     wallet = cli_get_wallet(wallet_name)
-    typical_fee = estimate_tx_fee(3, 3, 'p2sh-p2wpkh')
+    typical_fee = estimate_tx_fee(2, 3, 'p2sh-p2wpkh')
     print('using fee estimate for utxo selection: ', typical_fee)
     #Choose a single utxo sufficient for the required Bob utxo amount.
     chosen_utxo = None
@@ -264,22 +323,83 @@ def cli_creator(wallet_name, bob_utxo, bob_pubkey, bob_amount):
                  alice_destination, alice_change]
     tweak, partially_signed_tx = create_coinjoin_proposal(bobdata, alicedata)
     if not tweak:
-        print("You aborted the creation of a coinjoin proposal, qutting.")
+        print("You aborted the creation of a coinjoin proposal, quitting.")
         exit(0)
     encrypted_message = serialize_coinjoin_proposal(tweak, partially_signed_tx,
                                                     bob_pubkey)
     print("Here is the encrypted message, broadcast it anywhere:")
     print(encrypted_message)
 
+def cli_broadcast(wallet_name, partial_tx_hex):
+    """Given a partially signed transaction retrieved by running
+    this script with the -r flag, and assuming that the utxo with
+    which the transaction was made is in a Joinmarket wallet, this
+    function will complete the signing and then broadcast the transaction.
+    This function is useful if the *receiver*'s wallet is Joinmarket; if
+    it is Core then the workflow is just `signrawtransaction` then
+    `sendrawtransaction`; should be similar for Electrum although haven't tried.
+    """
+    wallet = cli_get_wallet(wallet_name)
+    tx = btc.deserialize(partial_tx_hex)
+    num_sigs = 0
+    for index, ins in enumerate(tx['ins']):
+        utxo = ins['outpoint']['hash'] + ':' + str(ins['outpoint']['index'])
+        #is the utxo in our utxos?
+        in_wallet_utxos = wallet.get_utxos_by_mixdepth(False)
+        for m, um in in_wallet_utxos.iteritems():
+            for k, v in um.iteritems():
+                if k == utxo:
+                    print("Found utxo in mixdepth: ", m)
+                    if isinstance(wallet, SegwitWallet):
+                        amount= v['value']
+                    else:
+                        amount = None
+                    signed_tx = btc.sign(partial_tx_hex, index,
+                             wallet.get_key_from_addr(v['address']),
+                             amount=amount)
+                    num_sigs += 1
+    if num_sigs != 1:
+        print("Something wrong, expected to get 1 sig, got: ", num_sigs)
+        return
+    #should be fully signed; broadcast?
+    print("Signed tx in hex:")
+    print(signed_tx)
+    print("In decoded form:")
+    print(pformat(btc.deserialize(signed_tx)))
+    if not raw_input("Broadcast to network? (y/n): ") == "y":
+        print("You chose not to broadcast, quitting.")
+        return
+    txid = btc.txhash(signed_tx)
+    print('txid = ' + txid)
+    pushed = jm_single().bc_interface.pushtx(signed_tx)
+    if not pushed:
+        print("Broadcast failed.")
+    else:
+        print("Broadcast was successful.")
+
+def cli_get_pubkey(wallet_name, address):
+    print("Checking for address: ", address)
+    wallet = cli_get_wallet(wallet_name)
+    privkey = wallet.get_key_from_addr(address)
+    pubkey = btc.privkey_to_pubkey(privkey)
+    print("Pubkey: ", pubkey)
+
 if __name__ == "__main__":
     parser = get_parser()
     (options, args) = parser.parse_args()
     load_program_config()
-    if options.receiver:
-        privkey, amount, filename = args[:3]
-        cli_receive(privkey, amount, filename)
+    if options.pubkey:
+        wallet_name, address = args[:2]
+        cli_get_pubkey(wallet_name, address)
         exit(0)
-
+    if options.broadcast:
+        wallet_name, partial_tx_hex = args[:2]
+        cli_broadcast(wallet_name, partial_tx_hex)
+        exit(0)
+    if options.receiver:
+        filename = args[0]
+        cli_receive(filename)
+        exit(0)
     wallet_name, bob_utxo, bob_pubkey, bob_amount = args[:4]
     bob_amount = int(bob_amount)
     cli_creator(wallet_name, bob_utxo, bob_pubkey, bob_amount)
