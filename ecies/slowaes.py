@@ -612,7 +612,7 @@ class AESModeOfOperation(object):
         return stringOut
 
 
-def encryptData(key, data, mode=AESModeOfOperation.modeOfOperation["CBC"]):
+def encryptData(key, data, mode=AESModeOfOperation.modeOfOperation["CBC"], iv=None):
     """encrypt `data` using `key`
 
     `key` should be a string of bytes.
@@ -626,17 +626,24 @@ def encryptData(key, data, mode=AESModeOfOperation.modeOfOperation["CBC"]):
         data = append_PKCS7_padding(data)
     keysize = len(key)
     assert keysize in AES.keySize.values(), 'invalid key size: %s' % keysize
-    # create a new iv using random data
-    iv = [ord(i) for i in os.urandom(16)]
+    if not iv:
+        # create a new iv using random data
+        iv = [ord(i) for i in os.urandom(16)]
+    else:
+        assert len(iv) == 16
+        iv = map(ord, iv)
     moo = AESModeOfOperation()
     (mode, length, ciph) = moo.encrypt(data, mode, key, keysize, iv)
     # With padding, the original length does not need to be known. It's a bad
     # idea to store the original message length.
-    # prepend the iv.
-    return ''.join(map(chr, iv)) + ''.join(map(chr, ciph))
+    # prepend the iv only if it wasn't provided in advance.
+    if not iv:
+        return ''.join(map(chr, iv)) + ''.join(map(chr, ciph))
+    else:
+        return ''.join(map(chr, ciph))
 
 
-def decryptData(key, data, mode=AESModeOfOperation.modeOfOperation["CBC"]):
+def decryptData(key, data, mode=AESModeOfOperation.modeOfOperation["CBC"], iv=None):
     """decrypt `data` using `key`
 
     `key` should be a string of bytes.
@@ -649,9 +656,13 @@ def decryptData(key, data, mode=AESModeOfOperation.modeOfOperation["CBC"]):
     key = map(ord, key)
     keysize = len(key)
     assert keysize in AES.keySize.values(), 'invalid key size: %s' % keysize
-    # iv is first 16 bytes
-    iv = map(ord, data[:16])
-    data = map(ord, data[16:])
+    if not iv:
+        # iv is first 16 bytes
+        iv = map(ord, data[:16])
+        data = map(ord, data[16:])
+    else:
+        iv = map(ord, iv)
+        data = map(ord, data)
     moo = AESModeOfOperation()
     decr = moo.decrypt(data, None, mode, key, keysize, iv)
     if mode == AESModeOfOperation.modeOfOperation["CBC"]:

@@ -11,8 +11,7 @@ from .slowaes import encryptData, decryptData
 #https://github.com/spesmilo/electrum/blob/master/lib/bitcoin.py
 #(although using different crypto libraries)
 #In particular, it shares the same ciphertext magic bytes, so messages
-#will be decryptable in Electrum (UPDATE: not quite; IV is done differently,
-#I can hack this to be compatible later TODO)
+#will be decryptable in Electrum.
 #Thus the following copied note applies:
 #
 #ECIES encryption/decryption methods;
@@ -24,9 +23,9 @@ def encrypt_message(message, pubkey_hex):
     alice_R = btc.privkey_to_pubkey(alice_r + "01") #use compression flag for pubkey
     ecdh_key = btc.multiply(alice_r, pubkey_hex, True,
                             rawpub=True, return_serialized=True)
-    key = hashlib.sha512(ecdh_key).digest()
-    key_e, key_m = key[0:16], key[16:]
-    ciphertext = encryptData(key_e, message)
+    key = hashlib.sha512(binascii.unhexlify(ecdh_key)).digest()
+    iv, key_e, key_m = key[0:16], key[16:32], key[32:]
+    ciphertext = encryptData(key_e, message, iv=iv)
     encrypted = b'BIE1' + binascii.unhexlify(alice_R) + ciphertext
     mac = hmac.new(key_m, encrypted, hashlib.sha256).digest()
 
@@ -44,9 +43,9 @@ def decrypt_message(encrypted, privkey):
         raise Exception('invalid ciphertext: invalid magic bytes')
     ecdh_key = btc.multiply(privkey[:64], ephemeral_pubkey, True,
                             rawpub=True, return_serialized=True)
-    key = hashlib.sha512(ecdh_key).digest()
-    key_e, key_m = key[0:16], key[16:]
+    key = hashlib.sha512(binascii.unhexlify(ecdh_key)).digest()
+    iv, key_e, key_m = key[0:16], key[16:32], key[32:]
     if mac != hmac.new(key_m, encrypted[:-32], hashlib.sha256).digest():
         raise Exception("ciphertext is not authenticated")
-    return decryptData(key_e, ciphertext)
+    return decryptData(key_e, ciphertext, iv=iv)
 
