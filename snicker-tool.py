@@ -3,12 +3,13 @@ from __future__ import print_function
 import binascii
 import os
 from optparse import OptionParser
+from pprint import pformat
 import jmbitcoin as btc
 from jmclient import (load_program_config, validate_address, jm_single,
                       WalletError, sync_wallet, RegtestBitcoinCoreInterface,
                       estimate_tx_fee, Wallet, SegwitWallet, get_p2pk_vbyte,
                       get_p2sh_vbyte)
-from jmbase.support import get_log, debug_dump_object, get_password
+from jmbase.support import get_password
 from ecies import encrypt_message, decrypt_message
 magic_bytes = "\xa9\x04\x11\xed\xf3\x84\x5a\xaa"
 version_bytes = "\x00\x01"
@@ -62,19 +63,6 @@ def get_parser():
                             'only for previously synced wallet'))
     return parser
 
-def test_encrypt_decrypt():
-    bob_privkey = binascii.hexlify(os.urandom(32)) + "01"
-    bob_pubkey = btc.privkey_to_pubkey(bob_privkey)
-    print("encrypting to bob's public key: " , bob_pubkey)
-    alicemsg = "hello, no cigar, but some beer, and here is some more text."
-    encrypted = encrypt_message(alicemsg, bob_pubkey)
-    print(encrypted)
-    raw_input("Enter to continue")
-    decrypted = decrypt_message(encrypted, bob_privkey)
-    print(decrypted)
-    if not alicemsg == decrypted:
-        print("Failed")
-
 def create_recipient_address(bob_pubkey, tweak=None, segwit=False):
     """Create a p2pkh receiving address
     from an existing pubkey, tweaked by a random 32 byte scalar.
@@ -117,8 +105,12 @@ def create_coinjoin_proposal(bobdata, alicedata):
             {"address": bob_destination, "value": coinjoin_amount},
             {"address": change, "value": change_amount}]
     unsigned_tx = btc.mktx(ins, outs)
-    print('here is proposed transaction', unsigned_tx)
-    raw_input()
+    print('here is proposed transaction:\n', pformat(btc.deserialize(unsigned_tx)))
+    print('destination for Bob: ', bob_destination)
+    print('destination for Alice: ', alice_destination)
+    print('destination for Alice change: ', change)
+    if not raw_input("Is this acceptable? (y/n):") == "y":
+        return (None, None)
     #Alice signs her input; assuming segwit here for now
     partially_signed_tx = btc.sign(unsigned_tx, 1, alice_privkey,
                                    amount=alice_amount)
@@ -133,10 +125,21 @@ def serialize_coinjoin_proposal(tweak, transaction, pubkey):
     return encrypt_message(msg, pubkey)
 
 def deserialize_coinjoin_proposal(msg):
+    """For a specific, already decrypted coinjoin proposal,
+    we attempt to decrypt, requiring correct header bytes;
+    if there is a failure, we return the reason as the second item,
+    and the first as False. If successfully parsed, we return the
+    tweak and the bitcoin transaction (serialized) that are embedded.
+    Return values are in hex.
+    Note that this simple process will be comically slow for parsing
+    large numbers of large messages; several mechanisms could improve this,
+    e.g. we may need to decrypt only first AES block, checking magic bytes.
+    """
     if not msg[:8] == magic_bytes:
-        return False
+        return (False, "Invalid SNICKER magic bytes")
     if not msg[8:10] == version_bytes:
-        return False
+        return (False, "Invalid SNICKER version bytes, should be: " + \
+                binascii.hexlify(version_bytes))
     tweak = binascii.hexlify(msg[10:42])
     tx = binascii.hexlify(msg[42:])
     return (tweak, tx)
@@ -156,24 +159,30 @@ def scan_for_coinjoins(privkey, amount, filename):
         except:
             print("Could not decrypt message, skipping")
             continue
+        if not tweak:
+            print("Could not decrypt message, reason: " + str(tx))
+            continue
         #We analyse the content of the transaction to check if it follows
         #our requirements
-        deserialized_tx = btc.deserialize(tx)
+        try:
+            deserialized_tx = btc.deserialize(tx)
+        except:
+            print("Proposed transaction is not correctly formatted, skipping.")
+            continue
         #construct our receiving address according to the tweak
         pubkey = btc.privkey_to_pubkey(privkey)
         tweak, destnpt, my_destn_addr = create_recipient_address(pubkey,
                                                                  tweak=tweak,
                                                                  segwit=True)
+        #add_privkeys requires both inputs to be compressed (or un-) consistently.
         tweak_priv = tweak + "01"
         my_destn_privkey = btc.add_privkeys(tweak_priv, privkey, True)
         print('my destn addr is: ', my_destn_addr)
+        #Insecure output of privkey here, for testing only (TODO)
         print('my destn privkey is: ', my_destn_privkey)
         my_output_index = -1
         for i, o in enumerate(deserialized_tx['outs']):
-            try:
-                addr = btc.script_to_address(o['script'], get_p2pk_vbyte())
-            except:
-                addr = btc.script_to_address(o['script'], get_p2sh_vbyte())
+            addr = btc.script_to_address(o['script'], get_p2sh_vbyte())
             if addr == my_destn_addr:
                 print('found our output address: ', my_destn_addr)
                 my_output_index = i
@@ -196,27 +205,19 @@ def scan_for_coinjoins(privkey, amount, filename):
         valid_coinjoins.append((my_destn_addr, my_destn_privkey, tx))
     return valid_coinjoins
 
-if __name__ == "__main__":
-    parser = get_parser()
-    (options, args) = parser.parse_args()
-    load_program_config()
-    if options.receiver:
-        privkey, amount, filename = args[:3]
-        valid_coinjoins = scan_for_coinjoins(privkey, int(amount), filename)
-        if not valid_coinjoins:
-            print("Found no valid coinjoins")
-            exit(0)
-        for vc in valid_coinjoins:
-            addr, priv, tx = vc
-            print("Found signable coinjoin with destination address: ", addr)
-            print("And this private key (p2sh-p2wpkh output): ", priv)
-            print("Pass this to signrawtransaction:")
-            print(tx)
-        exit(0)
+def cli_receive(privkey, amount, filename):
+    valid_coinjoins = scan_for_coinjoins(privkey, int(amount), filename)
+    if not valid_coinjoins:
+        print("Found no valid coinjoins")
+        return
+    for vc in valid_coinjoins:
+        addr, priv, tx = vc
+        print("Found signable coinjoin with destination address: ", addr)
+        print("And this private key (p2sh-p2wpkh output): ", priv)
+        print("Pass this to signrawtransaction:")
+        print(tx)
 
-    wallet_name, bob_utxo, bob_pubkey, bob_amount = args[:4]
-    bob_amount = int(bob_amount)
-    #Setup uses joinmarket wallet; this choice is just because it's easier for me.
+def cli_get_wallet(wallet_name):
     walletclass = SegwitWallet if jm_single().config.get(
             "POLICY", "segwit") == "true" else Wallet    
     if not os.path.exists(os.path.join('wallets', wallet_name)):
@@ -237,12 +238,15 @@ if __name__ == "__main__":
             "blockchain_source") == "electrum-server":
         jm_single().bc_interface.synctype = "with-script"
     sync_wallet(wallet, fast=options.fastsync)
-    print(wallet.unspent)
+    return wallet
+
+def cli_creator(wallet_name, bob_utxo, bob_pubkey, bob_amount):
+    #Setup uses joinmarket wallet; this choice is just because it's easier for me.
+    wallet = cli_get_wallet(wallet_name)
     typical_fee = estimate_tx_fee(3, 3, 'p2sh-p2wpkh')
     print('using fee estimate for utxo selection: ', typical_fee)
     #Choose a single utxo sufficient for the required Bob utxo amount.
     chosen_utxo = None
-    print('ubym', wallet.get_utxos_by_mixdepth(False))
     for k, v in wallet.get_utxos_by_mixdepth(False)[options.mixdepth].iteritems():
         if v['value'] > bob_amount + 2 * typical_fee:
             chosen_utxo = (k, v)
@@ -259,10 +263,26 @@ if __name__ == "__main__":
     alicedata = [chosen_utxo[0], privkey, chosen_utxo[1]['value'],
                  alice_destination, alice_change]
     tweak, partially_signed_tx = create_coinjoin_proposal(bobdata, alicedata)
+    if not tweak:
+        print("You aborted the creation of a coinjoin proposal, qutting.")
+        exit(0)
     encrypted_message = serialize_coinjoin_proposal(tweak, partially_signed_tx,
                                                     bob_pubkey)
     print("Here is the encrypted message, broadcast it anywhere:")
     print(encrypted_message)
+
+if __name__ == "__main__":
+    parser = get_parser()
+    (options, args) = parser.parse_args()
+    load_program_config()
+    if options.receiver:
+        privkey, amount, filename = args[:3]
+        cli_receive(privkey, amount, filename)
+        exit(0)
+
+    wallet_name, bob_utxo, bob_pubkey, bob_amount = args[:4]
+    bob_amount = int(bob_amount)
+    cli_creator(wallet_name, bob_utxo, bob_pubkey, bob_amount)
     print('done')
 
     
