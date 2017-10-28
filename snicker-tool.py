@@ -2,6 +2,7 @@
 from __future__ import print_function
 import binascii
 import os
+import random
 from optparse import OptionParser
 from pprint import pformat
 import jmbitcoin as btc
@@ -24,6 +25,25 @@ def get_parser():
         description='Creates an encrypted proposed coinjoin, or completes '
         +
         'signing of a proposed transaction.')
+    parser.add_option(
+        '-B',
+        '--batch-create',
+        action='store',
+        dest='batch_create',
+        default=None,
+        help=
+        'For creation, read utxos from a file whose per-line format is '
+        'pubkey, addr, satoshis-amount, utxo(txid:N)')
+    parser.add_option(
+        '-F',
+        '--amount-filter',
+        action='store',
+        type='int',
+        dest='amount_filter',
+        default=2000000,
+        help=
+        'To be used with --batch-create; filter and only make coinjoin '
+        'proposals with amount greater than this value, default 2000000')
     parser.add_option(
         '-r',
         '--receiver',
@@ -107,7 +127,7 @@ def create_recipient_address(bob_pubkey, tweak=None, segwit=False):
                                                     magicbyte=get_p2pk_vbyte())
     return (tweak, destination_point, destination_address)
     
-def create_coinjoin_proposal(bobdata, alicedata):
+def create_coinjoin_proposal(bobdata, alicedata, verbose=True, incentive=0):
     """A very crude/static implementation of a coinjoin for SNICKER.
     **VERY DELIBERATELY STUPIDLY SIMPLE VERSION!**
     We assume only one utxo for each side (this will certainly change, Alice
@@ -120,23 +140,27 @@ def create_coinjoin_proposal(bobdata, alicedata):
     What is returned is (tweak, partially signed tx) which is enough information
     for Bob to complete.
     """
-    fee = estimate_tx_fee(3, 3, 'p2sh-p2wpkh')
+    fee = estimate_tx_fee(2, 3, 'p2sh-p2wpkh')
     bob_utxo, bob_pubkey, amount = bobdata
     alice_utxo, alice_privkey, alice_amount, alice_destination, change = alicedata
     ins = [bob_utxo, alice_utxo]
+    random.shuffle(ins)
     tweak, dest_pt, bob_destination = create_recipient_address(bob_pubkey, segwit=True)
-    coinjoin_amount = amount - int(fee/2)
-    change_amount = alice_amount - coinjoin_amount
+    print('using amount, alice_amount,incentive, fee: ' + ','.join([str(x) for x in [amount, alice_amount, incentive, fee]]))
+    coinjoin_amount = amount + incentive
+    change_amount = alice_amount - coinjoin_amount - incentive - fee
     outs = [{"address": alice_destination, "value": coinjoin_amount},
             {"address": bob_destination, "value": coinjoin_amount},
             {"address": change, "value": change_amount}]
+    random.shuffle(outs)
     unsigned_tx = btc.mktx(ins, outs)
-    print('here is proposed transaction:\n', pformat(btc.deserialize(unsigned_tx)))
-    print('destination for Bob: ', bob_destination)
-    print('destination for Alice: ', alice_destination)
-    print('destination for Alice change: ', change)
-    if not raw_input("Is this acceptable? (y/n):") == "y":
-        return (None, None)
+    if verbose:
+        print('here is proposed transaction:\n', pformat(btc.deserialize(unsigned_tx)))
+        print('destination for Bob: ', bob_destination)
+        print('destination for Alice: ', alice_destination)
+        print('destination for Alice change: ', change)
+        if not raw_input("Is this acceptable? (y/n):") == "y":
+            return (None, None)
     #Alice signs her input; assuming segwit here for now
     partially_signed_tx = btc.sign(unsigned_tx, 1, alice_privkey,
                                    amount=alice_amount)
@@ -294,14 +318,17 @@ def cli_get_wallet(wallet_name, sync=True):
         sync_wallet(wallet, fast=options.fastsync)
     return wallet
 
-def cli_creator(wallet_name, bob_utxo, bob_pubkey, bob_amount):
+def cli_creator(wallet_name, bob_utxo, bob_pubkey, bob_amount, verbose=True, incentive=0):
     """This setup currently uses a joinmarket wallet;
     this choice is just because it's easier for me. Given a
     previously identified (utxo, pubkey, amount) found on the blockchain,
     creates a partially signed coinjoin transaction using a utxo input
     from our own wallet.
     """
-    wallet = cli_get_wallet(wallet_name)
+    if not isinstance(wallet_name, SegwitWallet):
+        wallet = cli_get_wallet(wallet_name)
+    else:
+        wallet = wallet_name
     typical_fee = estimate_tx_fee(2, 3, 'p2sh-p2wpkh')
     print('using fee estimate for utxo selection: ', typical_fee)
     #Choose a single utxo sufficient for the required Bob utxo amount.
@@ -312,6 +339,7 @@ def cli_creator(wallet_name, bob_utxo, bob_pubkey, bob_amount):
             break
     if not chosen_utxo:
         print("Unable to find a suitable utxo for amount: ", bob_amount)
+        return None
     #need the private key to sign for this utxo
     privkey = wallet.get_key_from_addr(chosen_utxo[1]['address'])
     #get a destination and a change
@@ -321,14 +349,16 @@ def cli_creator(wallet_name, bob_utxo, bob_pubkey, bob_amount):
     bobdata = [bob_utxo, bob_pubkey, bob_amount]
     alicedata = [chosen_utxo[0], privkey, chosen_utxo[1]['value'],
                  alice_destination, alice_change]
-    tweak, partially_signed_tx = create_coinjoin_proposal(bobdata, alicedata)
+    tweak, partially_signed_tx = create_coinjoin_proposal(bobdata, alicedata, verbose=verbose, incentive=incentive)
     if not tweak:
         print("You aborted the creation of a coinjoin proposal, quitting.")
         exit(0)
     encrypted_message = serialize_coinjoin_proposal(tweak, partially_signed_tx,
                                                     bob_pubkey)
-    print("Here is the encrypted message, broadcast it anywhere:")
-    print(encrypted_message)
+    if verbose:
+        print("Here is the encrypted message, broadcast it anywhere:")
+        print(encrypted_message)
+    return encrypted_message
 
 def cli_broadcast(wallet_name, partial_tx_hex):
     """Given a partially signed transaction retrieved by running
@@ -395,6 +425,26 @@ if __name__ == "__main__":
     if options.broadcast:
         wallet_name, partial_tx_hex = args[:2]
         cli_broadcast(wallet_name, partial_tx_hex)
+        exit(0)
+    if options.batch_create:
+        encmsgs = []
+        with open(options.batch_create, "rb") as f:
+            wallet_name = args[0]
+            incentive = int(args[1])
+            wallet = cli_get_wallet(wallet_name)
+            results = f.read().strip()
+            for r in results.split("\n"):
+                print('using r: ', r)
+                pubkey, addr, amount, utxo = r.split(",")
+                amount = int(amount)
+                if amount > options.amount_filter:
+                    encmsg = cli_creator(wallet, utxo, pubkey, amount, verbose=True, incentive=incentive)
+                    if encmsg:
+                        encmsgs.append(encmsg)
+                else:
+                    print('ignoring result with amount: ', amount)
+        with open("encrypted_proposals.txt", "wb") as f:
+            f.write("\n".join(encmsgs))
         exit(0)
     if options.receiver:
         filename = args[0]
